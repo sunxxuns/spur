@@ -805,6 +805,21 @@ mod tests {
         assert!(!batch_script_uses_step_launch("# srun hidden in comment\n"));
     }
 
+    // Text matching cannot see through shell indirection: a launcher reached
+    // via a variable is indistinguishable from a plain command. Batch dispatch
+    // therefore does not use this to decide *where* a script runs — only the
+    // primary node ever runs the body. Kept as a reminder of that limit.
+    #[test]
+    fn batch_script_uses_step_launch_misses_indirect_launcher_paths() {
+        assert!(batch_script_uses_step_launch(
+            "/opt/ompi/bin/mpirun -n 4 ./a\n"
+        ));
+        assert!(!batch_script_uses_step_launch(
+            "$MPI_HOME/bin/mpirun -n 4 ./a\n"
+        ));
+        assert!(!batch_script_uses_step_launch("${MPI_HOME}/bin/srun ./a\n"));
+    }
+
     #[test]
     fn batch_script_uses_step_launch_ignores_launchers_in_quotes() {
         assert!(!batch_script_uses_step_launch(

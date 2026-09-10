@@ -24,8 +24,8 @@ use spur_core::config::{CgroupConfig, HooksConfig, MpiConfig};
 use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_NONE, MPI_PMIX};
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
-    batch_companion_hold_script, batch_script_uses_step_launch, build_multi_task_pmix_wrapper,
-    build_multi_task_wrapper, use_multi_task_launch,
+    batch_companion_hold_script, batch_dispatched_multi_node_pmix, batch_script_uses_step_launch,
+    build_multi_task_pmix_wrapper, build_multi_task_wrapper, use_multi_task_launch,
 };
 use spur_devices::DeviceRegistry;
 
@@ -2172,12 +2172,22 @@ impl SlurmAgent for AgentService {
             spec.work_dir.clone()
         };
 
-        let script =
-            if batch_script_uses_step_launch(&spec.script) && task_offset > 0 && !req.task_fanout {
-                batch_companion_hold_script().to_string()
-            } else {
-                build_job_script(&spec.script, &spec.argv, &spec.script_args)?
-            };
+        // The batch script belongs to the first node of the allocation; every
+        // other node holds its slice until a step reaches it. This was gated on
+        // spotting an inner step launcher in the script, but that guess fails
+        // open: `$MPI_HOME/bin/mpirun` and similar indirections read as a plain
+        // script, so the body ran on all N nodes at once over one allocation.
+        //
+        // Direct multi-node PMIx batch is the one case that really does launch
+        // ranks on every node, and the controller has already prepared PMIx
+        // there. Gate on the predicate the controller used so the two agree.
+        let launches_ranks_on_every_node =
+            batch_dispatched_multi_node_pmix(Some(&spec.mpi), spec.num_nodes, Some(&spec.script));
+        let script = if task_offset > 0 && !req.task_fanout && !launches_ranks_on_every_node {
+            batch_companion_hold_script().to_string()
+        } else {
+            build_job_script(&spec.script, &spec.argv, &spec.script_args)?
+        };
 
         // Compute tasks_per_node for both single- and multi-node jobs
         let tasks_per_node = if spec.tasks_per_node > 0 {
@@ -7290,6 +7300,122 @@ mod tests {
         assert_eq!(
             runs, 4,
             "task_fanout dispatch must still run tasks_per_node=4 copies, got {runs} run(s): {content:?}"
+        );
+    }
+
+    // Slurm runs the batch script once for the whole job, on the first node of
+    // the allocation; the others hold their slice until a step reaches them.
+    // Spur decided this by searching the script for an inner step launcher,
+    // which fails open on any indirection — `$MPI_HOME/bin/mpirun` reads as a
+    // plain script — so a two-node job ran its body on both nodes. That left
+    // two independent MPI jobs sharing one allocation and splitting the
+    // interconnect between them, which looks like an interconnect problem
+    // rather than a scheduling one. Nothing off the primary runs the body.
+    #[tokio::test]
+    async fn batch_script_is_held_off_the_primary_node() {
+        for (case, tail) in [
+            ("plain script", "hostname\n"),
+            ("indirect launcher", "$MPI_HOME/bin/mpirun -n 16 ./a.out\n"),
+        ] {
+            let svc = AgentService::new(
+                test_reporter(),
+                HooksConfig::default(),
+                Arc::new(Mutex::new(DeviceRegistry::new())),
+                spur_core::config::MemlockLimit::Unlimited,
+            );
+
+            let work_dir = tempfile::tempdir().unwrap();
+            let counter_path = work_dir.path().join("run_count.txt");
+            let script = format!(
+                "#!/bin/bash\necho ran >> \"{counter}\"\n{tail}",
+                counter = counter_path.display(),
+            );
+
+            let req = Request::new(LaunchJobRequest {
+                job_id: 5352,
+                spec: Some(JobSpec {
+                    script,
+                    num_tasks: 16,
+                    num_nodes: 2,
+                    tasks_per_node: 8,
+                    cpus_per_task: 1,
+                    work_dir: work_dir.path().to_string_lossy().to_string(),
+                    ..Default::default()
+                }),
+                allocated: Some(ResourceAllocations {
+                    cpus: 8,
+                    memory_mb: 0,
+                    devices: std::collections::HashMap::new(),
+                }),
+                // Second node of an 8-task-per-node allocation.
+                task_offset: 8,
+                ..Default::default()
+            });
+
+            let resp = svc.launch_job(req).await.expect("launch should succeed");
+            assert!(resp.into_inner().success, "{case}: launch should succeed");
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            assert!(
+                !counter_path.exists(),
+                "{case}: batch body ran on a non-primary node"
+            );
+
+            svc.cancel_job(Request::new(AgentCancelJobRequest {
+                job_id: 5352,
+                signal: 9,
+            }))
+            .await
+            .expect("cancel_job");
+        }
+    }
+
+    // The other half of the rule: the primary node of a multi-node allocation
+    // still runs the body, exactly once.
+    #[tokio::test]
+    async fn batch_script_runs_on_the_primary_node_of_a_multi_node_job() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let counter_path = work_dir.path().join("run_count.txt");
+        let script = format!(
+            "#!/bin/bash\necho ran >> \"{counter}\"\n",
+            counter = counter_path.display(),
+        );
+
+        let req = Request::new(LaunchJobRequest {
+            job_id: 5353,
+            spec: Some(JobSpec {
+                script,
+                num_tasks: 16,
+                num_nodes: 2,
+                tasks_per_node: 8,
+                cpus_per_task: 1,
+                work_dir: work_dir.path().to_string_lossy().to_string(),
+                ..Default::default()
+            }),
+            allocated: Some(ResourceAllocations {
+                cpus: 8,
+                memory_mb: 0,
+                devices: std::collections::HashMap::new(),
+            }),
+            task_offset: 0,
+            ..Default::default()
+        });
+
+        let resp = svc.launch_job(req).await.expect("launch should succeed");
+        assert!(resp.into_inner().success, "launch should succeed");
+
+        let content = wait_for_stable_file(&counter_path, 2_000).await;
+        let runs = content.lines().filter(|l| *l == "ran").count();
+        assert_eq!(
+            runs, 1,
+            "primary node must run the batch body once, got {runs} run(s): {content:?}"
         );
     }
 

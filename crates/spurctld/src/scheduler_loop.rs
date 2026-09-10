@@ -416,8 +416,10 @@ async fn process_assignment(
     // true only for the srun-as-batch-script fallback, where the dispatched
     // "script" is the literal command srun was asked to run tasks_per_node
     // times on this node (real srun semantics). False for a genuine sbatch
-    // batch script, which runs exactly once per node regardless of
-    // tasks_per_node, matching Slurm.
+    // batch script, which runs once for the whole job — on the first node of
+    // the allocation, regardless of tasks_per_node, matching Slurm. Every node
+    // still gets LaunchJob so its prolog runs and its slice is held; the agent
+    // substitutes a companion hold body off the primary.
     let (dispatch_spec, task_fanout) = if !spec.srun_job {
         (Some(spec.clone()), false)
     } else if !srun_step_dispatch {
