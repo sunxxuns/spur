@@ -512,6 +512,9 @@ service SlurmAgent {
   rpc SuspendJob(AgentSuspendJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
   rpc ProbeStepd(StepdProbeRequest) returns (StepdProbeResponse);
+  // Before preempting for a job, ask a node it would evacuate whether its own
+  // state would refuse that job's launch once the victims are gone. Side-effect free.
+  rpc PrecheckLaunch(PrecheckLaunchRequest) returns (PrecheckLaunchResponse);
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
   // Run a one-shot command on this node (for srun step dispatch).
   rpc RunCommand(RunCommandRequest) returns (RunCommandResponse);
@@ -1091,6 +1094,20 @@ message StepdProbeRequest {
 
 message StepdProbeResponse {
   bool active = 1;
+}
+
+message PrecheckLaunchRequest {
+  uint32 job_id = 1;
+  string target_node = 2;
+  repeated string gres = 3;               // The pending job's per-node GRES request
+  repeated uint32 releasing_job_ids = 4;  // Jobs the controller would evict to make room
+}
+
+message PrecheckLaunchResponse {
+  // False only when this node would certainly refuse the launch; anything the
+  // launch itself can resolve (pulling an image, reclaiming a stale owner) is accepted.
+  bool accepted = 1;
+  string reason = 2;
 }
 
 message ExecInJobRequest {

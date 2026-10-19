@@ -680,6 +680,24 @@ pub struct SchedulerConfig {
     /// factor above cannot do because it scales with the team's own quota.
     #[serde(default)]
     pub idle_fill_max_cluster_fraction: f64,
+    /// Whether preemption first asks each node it would evacuate if that node
+    /// would refuse the pending job's launch, before evicting anyone.
+    #[serde(default)]
+    pub preempt_precheck: PreemptPrecheck,
+}
+
+/// What preemption does with a node agent's answer to the pre-eviction check.
+/// An agent that is unreachable, slow, or too old to answer never blocks.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PreemptPrecheck {
+    /// Evict without asking.
+    Off,
+    /// Ask and log a refusal, but evict anyway.
+    Warn,
+    /// A refusal cancels the eviction and cools the refusing node down.
+    #[default]
+    Enforce,
 }
 
 /// How often an interactive client (`salloc`/`srun`) pings the controller to
@@ -728,6 +746,7 @@ impl Default for SchedulerConfig {
             idle_fill_exempt_secs: default_idle_fill_exempt_secs(),
             idle_fill_max_borrow_factor: 0.0,
             idle_fill_max_cluster_fraction: 0.0,
+            preempt_precheck: PreemptPrecheck::default(),
         }
     }
 }

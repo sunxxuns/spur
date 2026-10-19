@@ -7184,6 +7184,12 @@ mod tests {
                 active: self.active,
             }))
         }
+        async fn precheck_launch(
+            &self,
+            _request: Request<spur_proto::proto::PrecheckLaunchRequest>,
+        ) -> Result<Response<spur_proto::proto::PrecheckLaunchResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
         async fn exec_in_job(
             &self,
             _request: Request<spur_proto::proto::ExecInJobRequest>,

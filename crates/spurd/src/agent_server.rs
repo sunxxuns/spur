@@ -6181,6 +6181,63 @@ impl SlurmAgent for AgentService {
         Ok(Response::new(StepdProbeResponse { active }))
     }
 
+    async fn precheck_launch(
+        &self,
+        request: Request<PrecheckLaunchRequest>,
+    ) -> Result<Response<PrecheckLaunchResponse>, Status> {
+        Self::require_controller(&request)?;
+        let req = request.into_inner();
+        if !self.agent_owns_node(&req.target_node) {
+            return Ok(Response::new(PrecheckLaunchResponse {
+                accepted: false,
+                reason: format!(
+                    "agent on {} would refuse a launch addressed to {}",
+                    self.reporter.hostname, req.target_node
+                ),
+            }));
+        }
+        let (needed, gpu_type) = Self::parse_gpu_gres(&req.gres);
+        if needed == 0 {
+            return Ok(Response::new(PrecheckLaunchResponse {
+                accepted: true,
+                reason: String::new(),
+            }));
+        }
+        let releasing: std::collections::HashSet<u32> =
+            req.releasing_job_ids.iter().copied().collect();
+        // Same lock order and liveness view as the launch-time reclaim, so the
+        // answer matches what `allocate_local_resources` would decide.
+        let running = self.running.lock().await;
+        let live: std::collections::HashSet<u32> = running.keys().copied().collect();
+        let free = self.allocation.lock().await.free_gpus_after_release(
+            &releasing,
+            &live,
+            gpu_type.as_deref(),
+        );
+        drop(running);
+        if free < needed {
+            warn!(
+                job_id = req.job_id,
+                needed,
+                free,
+                releasing = ?req.releasing_job_ids,
+                "precheck: launch would be refused, GPUs held by jobs the controller is not evicting"
+            );
+            return Ok(Response::new(PrecheckLaunchResponse {
+                accepted: false,
+                reason: format!(
+                    "{free} of {needed} GPUs free after evicting {:?}; the rest are held by \
+                     running or launching jobs",
+                    req.releasing_job_ids
+                ),
+            }));
+        }
+        Ok(Response::new(PrecheckLaunchResponse {
+            accepted: true,
+            reason: String::new(),
+        }))
+    }
+
     async fn exec_in_job(
         &self,
         request: Request<ExecInJobRequest>,
@@ -16682,6 +16739,90 @@ mod tests {
             0,
             "launching owner must be spared"
         );
+    }
+
+    fn precheck_request(
+        svc: &AgentService,
+        gres: &str,
+        releasing: &[u32],
+    ) -> PrecheckLaunchRequest {
+        PrecheckLaunchRequest {
+            job_id: 100,
+            target_node: svc.reporter.hostname.clone(),
+            gres: vec![gres.into()],
+            releasing_job_ids: releasing.to_vec(),
+        }
+    }
+
+    async fn precheck(svc: &AgentService, req: PrecheckLaunchRequest) -> PrecheckLaunchResponse {
+        svc.precheck_launch(Request::new(req))
+            .await
+            .expect("precheck must answer")
+            .into_inner()
+    }
+
+    // The precheck must agree with the launch gate above: GPUs held by a running
+    // job the controller is not evicting refuse, the evicted job's GPUs count as free.
+    #[tokio::test]
+    async fn precheck_refuses_gpus_held_by_a_running_non_victim() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0, 1]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.insert_test_job(98, TrackedJob::dummy(0)).await;
+        svc.insert_test_job(99, TrackedJob::dummy(0)).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(98, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(98, 1);
+            alloc.allocate_for_job(99, 1, 1, 0, &[1]).unwrap();
+            alloc.commit_job(99, 1);
+        }
+
+        let refused = precheck(&svc, precheck_request(&svc, "gpu:2", &[98])).await;
+        assert!(!refused.accepted, "job 99 still holds a GPU");
+        assert!(refused.reason.contains("1 of 2"), "{}", refused.reason);
+
+        let accepted = precheck(&svc, precheck_request(&svc, "gpu:2", &[98, 99])).await;
+        assert!(accepted.accepted, "{}", accepted.reason);
+    }
+
+    // A stale owner is reclaimed at launch, so it must not block the precheck.
+    #[tokio::test]
+    async fn precheck_accepts_when_only_stale_owners_hold_gpus() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(99, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(99, 1);
+        }
+        let res = precheck(&svc, precheck_request(&svc, "gpu:1", &[])).await;
+        assert!(res.accepted, "{}", res.reason);
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "the precheck must not reclaim"
+        );
+    }
+
+    #[tokio::test]
+    async fn precheck_refuses_a_launch_addressed_to_another_node() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let mut req = precheck_request(&svc, "gpu:1", &[]);
+        req.target_node = "not-this-node.invalid".into();
+        assert!(!precheck(&svc, req).await.accepted);
     }
 
     fn gpu_alloc_request(device_ids: &[u64]) -> ResourceAllocations {

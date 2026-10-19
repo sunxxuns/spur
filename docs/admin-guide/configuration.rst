@@ -590,6 +590,21 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        ``sacctmgr``); the most specific value wins (QOS > partition > global).
        Mirrors Slurm's ``PreemptExemptTime``. Does not apply to idle-fill reclaim,
        which uses ``idle_fill_exempt_secs`` instead.
+   * - ``preempt_precheck``
+     - string
+     - ``"enforce"``
+     - Live
+     - Before preempting, ask the agent on each node the eviction would empty
+       whether it would refuse the pending job's launch once the victims are
+       gone: for example because its GPUs are still held by a job the controller
+       no longer tracks. ``"enforce"`` (default) cancels the eviction on a
+       refusal and puts the refusing node on dispatch cooldown
+       (``controller.dispatch_reject_cooldown_secs``), so the next cycle proves
+       placement without it. ``"warn"`` logs the refusal and evicts anyway, for
+       rollout. ``"off"`` skips the check. Only a definite refusal counts: an
+       agent that is unreachable, takes longer than two seconds, or predates the
+       check never blocks preemption, and nothing the launch itself can resolve
+       (pulling an image, reclaiming a stale GPU owner) is refused.
    * - ``idle_fill_enabled``
      - boolean
      - ``false``

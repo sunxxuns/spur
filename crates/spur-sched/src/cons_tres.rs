@@ -183,20 +183,38 @@ impl NodeAllocation {
         self.gpu_allocated
             .iter()
             .enumerate()
-            .filter(|(i, allocated)| {
-                if **allocated {
-                    return false;
-                }
-                if let Some(gtype) = gpu_type {
-                    if gtype != "any"
-                        && self.gpus.get(*i).map(|g| g.gpu_type.as_str()) != Some(gtype)
-                    {
-                        return false;
-                    }
-                }
-                true
-            })
+            .filter(|(i, allocated)| !**allocated && self.gpu_is_type(*i, gpu_type))
             .count() as u32
+    }
+
+    /// GPUs of `gpu_type` that a launch could claim once every job in `releasing`
+    /// has let go. An owner that is neither `live` nor mid-launch is stale and a
+    /// launch reclaims it, so only live and launching owners hold a GPU here.
+    pub fn free_gpus_after_release(
+        &self,
+        releasing: &HashSet<u32>,
+        live: &HashSet<u32>,
+        gpu_type: Option<&str>,
+    ) -> u32 {
+        let held: HashSet<u64> = self
+            .owners
+            .iter()
+            .filter(|(id, _)| !releasing.contains(id))
+            .filter(|(id, _)| live.contains(id) || self.launching.contains_key(id))
+            .flat_map(|(_, owned)| owned.result.gpu_ids.iter().copied())
+            .collect();
+        self.gpus
+            .iter()
+            .enumerate()
+            .filter(|(i, gpu)| !held.contains(&gpu.stable_id) && self.gpu_is_type(*i, gpu_type))
+            .count() as u32
+    }
+
+    fn gpu_is_type(&self, index: usize, gpu_type: Option<&str>) -> bool {
+        match gpu_type {
+            None | Some("any") => true,
+            Some(gtype) => self.gpus.get(index).map(|g| g.gpu_type.as_str()) == Some(gtype),
+        }
     }
 
     /// Free the bitmaps/counters an allocation held. Internal helper: callers
@@ -1225,5 +1243,52 @@ mod tests {
         // release by the same stable id frees it
         assert!(node.release_job(7));
         assert_eq!(node.free_gpus(None), 3);
+    }
+
+    fn ids(jobs: &[u32]) -> HashSet<u32> {
+        jobs.iter().copied().collect()
+    }
+
+    #[test]
+    fn free_gpus_after_release_counts_releasing_owners_as_free() {
+        let mut node = make_node(64, 256_000, 8, "mi300x");
+        node.allocate_for_job(1, 1, 0, 0, &[0, 1, 2, 3]).unwrap();
+        node.commit_job(1, 1);
+        node.allocate_for_job(2, 1, 0, 0, &[4, 5]).unwrap();
+        node.commit_job(2, 1);
+        let live = ids(&[1, 2]);
+        assert_eq!(node.free_gpus_after_release(&ids(&[]), &live, None), 2);
+        assert_eq!(node.free_gpus_after_release(&ids(&[1]), &live, None), 6);
+        assert_eq!(node.free_gpus_after_release(&ids(&[1, 2]), &live, None), 8);
+    }
+
+    #[test]
+    fn free_gpus_after_release_ignores_stale_owners() {
+        let mut node = make_node(64, 256_000, 8, "mi300x");
+        node.allocate_for_job(1, 1, 0, 0, &[0, 1, 2, 3]).unwrap();
+        node.commit_job(1, 1);
+        // Committed but not running: a launch would reclaim it.
+        assert_eq!(node.free_gpus_after_release(&ids(&[]), &ids(&[]), None), 8);
+    }
+
+    #[test]
+    fn free_gpus_after_release_keeps_launching_owners() {
+        let mut node = make_node(64, 256_000, 8, "mi300x");
+        node.allocate_for_job(1, 1, 0, 0, &[0, 1, 2, 3]).unwrap();
+        // Not live yet but mid-launch, so it still holds its GPUs.
+        assert_eq!(node.free_gpus_after_release(&ids(&[]), &ids(&[]), None), 4);
+        assert_eq!(node.free_gpus_after_release(&ids(&[1]), &ids(&[]), None), 8);
+    }
+
+    #[test]
+    fn free_gpus_after_release_filters_by_type() {
+        let node = make_node(64, 256_000, 4, "mi300x");
+        let none = ids(&[]);
+        assert_eq!(
+            node.free_gpus_after_release(&none, &none, Some("mi300x")),
+            4
+        );
+        assert_eq!(node.free_gpus_after_release(&none, &none, Some("any")), 4);
+        assert_eq!(node.free_gpus_after_release(&none, &none, Some("mi250")), 0);
     }
 }

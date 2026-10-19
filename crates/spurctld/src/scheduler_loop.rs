@@ -14,7 +14,7 @@ use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     AgentCancelJobRequest, AgentSuspendJobRequest, JobSpec as ProtoJobSpec, LaunchJobRequest,
-    RegisterJobAllocationRequest, SubmitJobRequest,
+    PrecheckLaunchRequest, RegisterJobAllocationRequest, SubmitJobRequest,
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
@@ -27,6 +27,10 @@ use crate::raft::RaftHandle;
 /// awaits delivery. Best-effort cleanup must not stall eviction on an
 /// unreachable agent.
 const CANCEL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on the pre-eviction launch check. It runs inside the scheduling
+/// pass, and an agent that cannot answer in time abstains rather than blocks.
+const PRECHECK_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Grace between SIGTERM and SIGKILL when force-finishing a job. The time-limit
 /// and inactive-limit watchdogs share it so the two windows can't drift apart.
@@ -952,7 +956,8 @@ fn effective_exempt_secs(
 /// Preempt running jobs to make room for pending ones. Only runs under
 /// `preempt_type = qos_priority`; eligibility and mode resolution follow the
 /// decision table in the admin guide. Victim selection proves the eviction
-/// would actually place the pending job; a non-`gone` failure mid-set leaves
+/// would actually place the pending job, and under `preempt_precheck` the nodes
+/// it would empty must not refuse that launch; a non-`gone` failure mid-set leaves
 /// the already-evicted victims evicted with the pending job still unplaced.
 pub(crate) async fn try_preempt(
     cluster: &Arc<ClusterManager>,
@@ -1119,7 +1124,7 @@ pub(crate) async fn try_preempt(
             if pool_ids.is_empty() {
                 continue;
             }
-            let set = satisfiable_victim_set(
+            let plan = victim_plan(
                 pending,
                 &VictimPool {
                     evictable: &pool_ids,
@@ -1131,14 +1136,22 @@ pub(crate) async fn try_preempt(
                 &reservations,
                 now,
             );
-            if set.is_some() {
-                found = if is_suspend_pool { None } else { set };
+            if plan.is_some() {
+                found = if is_suspend_pool { None } else { plan };
                 break;
             }
         }
-        let Some(victims) = found else {
+        let Some(plan) = found else {
             continue;
         };
+        // The proof only sees the controller's view; a node agent can still hold
+        // GPUs for a job the controller no longer tracks. Evicting then only
+        // destroys work, and a resubmitted pending job would repeat it every cycle.
+        if !precheck_evacuation(cluster, pending, &plan, &occupants, sched.preempt_precheck).await {
+            // One refused round per cycle bounds the latency the check adds.
+            break;
+        }
+        let victims = plan.victims;
 
         let preempt_qos = if sched.preempt_type == PreemptType::QosPriority {
             Some(pending_qos.name.clone())
@@ -1425,13 +1438,8 @@ struct VictimPool<'a> {
 }
 
 /// The set of evictable jobs whose removal would let `reclaimer` actually run, or
-/// `None` when no such set exists. Shared by reclaim and preemption.
-///
-/// Atomic by construction: a node counts as recovered only when every job on it is
-/// evictable, so the reclaimer either gets a full allocation or nothing is
-/// touched. A partial eviction destroys work without helping anyone, and an
-/// unplaceable job has no satisfiable set at all — which is what stops a job that
-/// can never be placed from evicting one victim per cycle forever (§8.2).
+/// `None` when no such set exists. Reclaim needs only the set; preemption also
+/// checks the nodes it would evacuate (see [`victim_plan`]).
 fn satisfiable_victim_set(
     reclaimer: &spur_core::job::Job,
     pool: &VictimPool<'_>,
@@ -1439,6 +1447,30 @@ fn satisfiable_victim_set(
     reservations: &[spur_core::reservation::Reservation],
     now: DateTime<Utc>,
 ) -> Option<HashSet<spur_core::job::JobId>> {
+    victim_plan(reclaimer, pool, nodes, reservations, now).map(|plan| plan.victims)
+}
+
+/// A satisfiable victim set and the nodes evicting it would empty.
+struct VictimPlan {
+    victims: HashSet<spur_core::job::JobId>,
+    evacuated: Vec<String>,
+}
+
+/// The evictable jobs whose removal would let `reclaimer` actually run, and the
+/// nodes that removal empties, or `None` when no such set exists.
+///
+/// Atomic by construction: a node counts as recovered only when every job on it is
+/// evictable, so the reclaimer either gets a full allocation or nothing is
+/// touched. A partial eviction destroys work without helping anyone, and an
+/// unplaceable job has no satisfiable set at all — which is what stops a job that
+/// can never be placed from evicting one victim per cycle forever (§8.2).
+fn victim_plan(
+    reclaimer: &spur_core::job::Job,
+    pool: &VictimPool<'_>,
+    nodes: &[spur_core::node::Node],
+    reservations: &[spur_core::reservation::Reservation],
+    now: DateTime<Utc>,
+) -> Option<VictimPlan> {
     let placement = spur_sched::node_match::NodePlacement::new(reclaimer);
     let required = spur_sched::backfill::job_resource_request(reclaimer);
     // Total rather than currently-free resources: an evacuated node is empty, so
@@ -1453,6 +1485,7 @@ fn satisfiable_victim_set(
     let needed = (reclaimer.spec.num_nodes as usize).max(1);
     let mut have = 0usize;
     let mut victims = HashSet::new();
+    let mut evacuated = Vec::new();
     let mut evacuable = Vec::new();
 
     for node in nodes {
@@ -1491,15 +1524,116 @@ fn satisfiable_victim_set(
         (cost, *name)
     });
 
-    for (_, on_node) in evacuable {
+    for (name, on_node) in evacuable {
         if have >= needed {
             break;
         }
         have += 1;
         victims.extend(on_node.iter().copied());
+        evacuated.push(name.to_string());
     }
 
-    (have >= needed && !victims.is_empty()).then_some(victims)
+    (have >= needed && !victims.is_empty()).then_some(VictimPlan { victims, evacuated })
+}
+
+/// Ask every node `plan` would evacuate whether its agent would refuse
+/// `pending`'s launch once the victims are gone. False means the eviction must
+/// not happen; each refusing node is then cooled down, so the next pass proves
+/// placement without it instead of picking it again.
+async fn precheck_evacuation(
+    cluster: &Arc<ClusterManager>,
+    pending: &spur_core::job::Job,
+    plan: &VictimPlan,
+    occupants: &HashMap<&str, Vec<spur_core::job::JobId>>,
+    mode: spur_core::config::PreemptPrecheck,
+) -> bool {
+    use spur_core::config::PreemptPrecheck;
+
+    if mode == PreemptPrecheck::Off {
+        return true;
+    }
+    let mut checks = tokio::task::JoinSet::new();
+    for node_name in &plan.evacuated {
+        let Some(addr) = cluster
+            .get_node(node_name)
+            .as_ref()
+            .and_then(node_comm_http_url)
+        else {
+            continue;
+        };
+        let request = PrecheckLaunchRequest {
+            job_id: pending.job_id,
+            target_node: node_name.clone(),
+            gres: pending.spec.gres.clone(),
+            releasing_job_ids: occupants
+                .get(node_name.as_str())
+                .cloned()
+                .unwrap_or_default(),
+        };
+        let node_name = node_name.clone();
+        checks.spawn(async move { (node_name, precheck_one_agent(addr, request).await) });
+    }
+    let mut refused = Vec::new();
+    while let Some(joined) = checks.join_next().await {
+        if let Ok((node, Some(reason))) = joined {
+            refused.push((node, reason));
+        }
+    }
+    let enforce = mode == PreemptPrecheck::Enforce;
+    for (node, reason) in &refused {
+        warn!(
+            pending_job = pending.job_id,
+            node = %node,
+            reason = %reason,
+            enforced = enforce,
+            "node agent would refuse the preempting job's launch"
+        );
+        if enforce {
+            cluster.cool_down_node(node);
+        }
+    }
+    refused.is_empty() || !enforce
+}
+
+/// The agent's refusal reason, or `None` when it accepts or cannot say. Only a
+/// definite answer refuses: an agent without the RPC, an unreachable one, or a
+/// slow one abstains, so the check never blocks more than it did before.
+async fn precheck_one_agent(agent_addr: String, request: PrecheckLaunchRequest) -> Option<String> {
+    let job_id = request.job_id;
+    let attempt = async {
+        let mut client = match crate::agent_client::connect(agent_addr.clone()).await {
+            Ok(client) => client
+                .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE),
+            Err(e) => {
+                debug!(job_id, agent = %agent_addr, error = %e, "precheck: agent unreachable");
+                return None;
+            }
+        };
+        match client.precheck_launch(request).await {
+            Ok(response) => {
+                let response = response.into_inner();
+                (!response.accepted).then_some(response.reason)
+            }
+            // LaunchJob sits behind the same controller gate, so it would fail too.
+            Err(status)
+                if matches!(
+                    status.code(),
+                    tonic::Code::PermissionDenied | tonic::Code::Unauthenticated
+                ) =>
+            {
+                Some(status.message().to_string())
+            }
+            Err(status) => {
+                debug!(job_id, agent = %agent_addr, error = %status, "precheck: no answer");
+                None
+            }
+        }
+    };
+    tokio::time::timeout(PRECHECK_RPC_TIMEOUT, attempt)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// True when `candidate` occupies a node the pending job could target.
@@ -4535,6 +4669,10 @@ mod tests {
             /// start_job fails, standing in for a node that confirmed its
             /// launch but could not then release the workload.
             reject_start: bool,
+            /// precheck_launch answers with this; `None` is an agent too old
+            /// to have the RPC.
+            precheck_reply: Option<spur_proto::proto::PrecheckLaunchResponse>,
+            precheck_calls: Arc<AtomicU32>,
         }
 
         #[tonic::async_trait]
@@ -4664,6 +4802,18 @@ mod tests {
             ) -> Result<tonic::Response<spur_proto::proto::StepdProbeResponse>, tonic::Status>
             {
                 Ok(tonic::Response::new(Default::default()))
+            }
+
+            async fn precheck_launch(
+                &self,
+                _request: tonic::Request<spur_proto::proto::PrecheckLaunchRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::PrecheckLaunchResponse>, tonic::Status>
+            {
+                self.precheck_calls.fetch_add(1, Ordering::SeqCst);
+                match &self.precheck_reply {
+                    Some(reply) => Ok(tonic::Response::new(reply.clone())),
+                    None => Err(tonic::Status::unimplemented("PrecheckLaunch")),
+                }
             }
 
             async fn exec_in_job(
@@ -4901,6 +5051,8 @@ mod tests {
                 fanout_calls: capture.then(|| fanout_calls.clone()),
                 reject_start: false,
                 cancel_delay,
+                precheck_reply: None,
+                precheck_calls: Arc::new(AtomicU32::new(0)),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4929,6 +5081,8 @@ mod tests {
                 fanout_calls: None,
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
+                precheck_reply: None,
+                precheck_calls: Arc::new(AtomicU32::new(0)),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4957,6 +5111,8 @@ mod tests {
                 fanout_calls: None,
                 reject_start: true,
                 cancel_delay: Duration::ZERO,
+                precheck_reply: None,
+                precheck_calls: Arc::new(AtomicU32::new(0)),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4967,6 +5123,39 @@ mod tests {
                     .await;
             });
             (addr, cancel_calls)
+        }
+
+        /// Mock agent whose precheck_launch answers with `reply` (`None`: the
+        /// RPC is missing). Returns the address, cancel calls and precheck calls.
+        async fn spawn_mock_agent_with_precheck(
+            reply: Option<spur_proto::proto::PrecheckLaunchResponse>,
+        ) -> (std::net::SocketAddr, Arc<AtomicU32>, Arc<AtomicU32>) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let cancel_calls = Arc::new(AtomicU32::new(0));
+            let precheck_calls = Arc::new(AtomicU32::new(0));
+            let agent = MockAgent {
+                cancel_calls: cancel_calls.clone(),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: None,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+                precheck_reply: reply,
+                precheck_calls: precheck_calls.clone(),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, cancel_calls, precheck_calls)
         }
 
         /// Mock agent whose launch_job always rejects with ResourceExhausted,
@@ -7254,6 +7443,139 @@ mod tests {
                 "failed-precondition-reject",
             )
             .await;
+        }
+
+        struct PrecheckRun {
+            _dir: TempDir,
+            cm: Arc<ClusterManager>,
+            victim: spur_core::job::JobId,
+            precheck_calls: Arc<AtomicU32>,
+        }
+
+        /// One node held by a low-QOS job, and a high-QOS job allowed to preempt
+        /// it, run through `try_preempt` with the agent answering `reply`.
+        async fn preempt_with_precheck(
+            reply: Option<spur_proto::proto::PrecheckLaunchResponse>,
+            mode: spur_core::config::PreemptPrecheck,
+        ) -> PrecheckRun {
+            use spur_core::accounting::Qos;
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.partitions[0].preempt_mode = "cancel".into();
+            config.scheduler.preempt_type = spur_core::partition::PreemptType::QosPriority;
+            config.scheduler.preempt_precheck = mode;
+            let cm = test_cluster_with_config(&dir, config).await;
+            let (addr, _cancel_calls, precheck_calls) = spawn_mock_agent_with_precheck(reply).await;
+            register_node_at(&cm, "n1", addr);
+            cm.qos_cache().insert(Qos {
+                name: "low".into(),
+                priority: 100,
+                ..Default::default()
+            });
+            cm.qos_cache().insert(Qos {
+                name: "high".into(),
+                priority: 10_000,
+                preempt: vec!["low".into()],
+                ..Default::default()
+            });
+
+            let spec = |name: &str| JobSpec {
+                name: name.into(),
+                user: "testuser".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                qos: Some(name.into()),
+                ..Default::default()
+            };
+            let victim = submit_and_wait(&cm, spec("low"));
+            let alloc = ResourceAllocations::with_scalar(4, 0);
+            cm.start_job(
+                victim,
+                vec!["n1".into()],
+                alloc.clone(),
+                HashMap::from([("n1".to_string(), alloc)]),
+            )
+            .unwrap();
+            settle(&cm, victim, JobState::Running);
+
+            let pending = cm.get_job(submit_and_wait(&cm, spec("high"))).unwrap();
+            try_preempt(
+                &cm,
+                &cm.get_partitions(),
+                &cm.get_nodes(),
+                &[&pending],
+                &cm.config().scheduler,
+            )
+            .await;
+            PrecheckRun {
+                _dir: dir,
+                cm,
+                victim,
+                precheck_calls,
+            }
+        }
+
+        fn refusal() -> Option<spur_proto::proto::PrecheckLaunchResponse> {
+            Some(spur_proto::proto::PrecheckLaunchResponse {
+                accepted: false,
+                reason: "0 of 8 GPUs free after evicting [1]".into(),
+            })
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn enforced_precheck_refusal_evicts_nobody_and_cools_the_node_down() {
+            use spur_core::config::PreemptPrecheck;
+            use spur_core::job::JobState;
+
+            let run = preempt_with_precheck(refusal(), PreemptPrecheck::Enforce).await;
+            assert_eq!(run.precheck_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                run.cm.get_job(run.victim).unwrap().state,
+                JobState::Running,
+                "a launch the node would refuse must not cost the victim its run"
+            );
+            assert!(run.cm.nodes_on_dispatch_cooldown().contains("n1"));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn warn_mode_precheck_refusal_still_evicts() {
+            use spur_core::config::PreemptPrecheck;
+            use spur_core::job::JobState;
+
+            let run = preempt_with_precheck(refusal(), PreemptPrecheck::Warn).await;
+            assert_eq!(run.precheck_calls.load(Ordering::SeqCst), 1);
+            wait_for("victim evicted", || {
+                run.cm.get_job(run.victim).unwrap().state != JobState::Running
+            });
+            assert!(run.cm.nodes_on_dispatch_cooldown().is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn agent_without_precheck_rpc_does_not_block_preemption() {
+            use spur_core::config::PreemptPrecheck;
+            use spur_core::job::JobState;
+
+            let run = preempt_with_precheck(None, PreemptPrecheck::Enforce).await;
+            assert_eq!(run.precheck_calls.load(Ordering::SeqCst), 1);
+            wait_for("victim evicted", || {
+                run.cm.get_job(run.victim).unwrap().state != JobState::Running
+            });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn precheck_off_never_asks_the_agent() {
+            use spur_core::config::PreemptPrecheck;
+            use spur_core::job::JobState;
+
+            let run = preempt_with_precheck(refusal(), PreemptPrecheck::Off).await;
+            wait_for("victim evicted", || {
+                run.cm.get_job(run.victim).unwrap().state != JobState::Running
+            });
+            assert_eq!(run.precheck_calls.load(Ordering::SeqCst), 0);
         }
     }
 

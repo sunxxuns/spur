@@ -746,6 +746,18 @@ impl SlurmAgent for VirtualAgent {
         Ok(Response::new(StepdProbeResponse { active: false }))
     }
 
+    async fn precheck_launch(
+        &self,
+        _request: Request<PrecheckLaunchRequest>,
+    ) -> Result<Response<PrecheckLaunchResponse>, Status> {
+        // Pods are placed by the Kubernetes scheduler, not this node's allocation
+        // table, so there is nothing local to refuse on.
+        Ok(Response::new(PrecheckLaunchResponse {
+            accepted: true,
+            reason: String::new(),
+        }))
+    }
+
     async fn exec_in_job(
         &self,
         request: Request<ExecInJobRequest>,

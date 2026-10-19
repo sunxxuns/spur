@@ -205,6 +205,7 @@ mock_agent_impl! {
         suspend_job(proto::AgentSuspendJobRequest) -> ();
         get_node_resources(()) -> proto::NodeResourcesResponse;
         probe_stepd(proto::StepdProbeRequest) -> proto::StepdProbeResponse;
+        precheck_launch(proto::PrecheckLaunchRequest) -> proto::PrecheckLaunchResponse;
         exec_in_job(proto::ExecInJobRequest) -> proto::ExecInJobResponse;
         run_command(proto::RunCommandRequest) -> proto::RunCommandResponse;
         cancel_step(proto::CancelStepRequest) -> ();
